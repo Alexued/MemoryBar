@@ -8,6 +8,29 @@ enum ResourcePane: String, CaseIterable, Identifiable {
     var id: String { rawValue }
 }
 
+private let paneAnimation = Animation.timingCurve(0.22, 1.0, 0.36, 1.0, duration: 0.36)
+
+private extension View {
+    func resourceSwipe(selectedPane: Binding<ResourcePane>) -> some View {
+        simultaneousGesture(
+            DragGesture(minimumDistance: 28)
+                .onEnded { value in
+                    guard abs(value.translation.width) > abs(value.translation.height) else {
+                        return
+                    }
+
+                    withAnimation(paneAnimation) {
+                        if value.translation.width < 0 {
+                            selectedPane.wrappedValue = .disk
+                        } else {
+                            selectedPane.wrappedValue = .memory
+                        }
+                    }
+                }
+        )
+    }
+}
+
 struct StatusPopoverView: View {
     @ObservedObject var monitor: SystemMonitor
     let openDetails: () -> Void
@@ -23,11 +46,24 @@ struct StatusPopoverView: View {
             }
             .pickerStyle(.segmented)
 
-            if selectedPane == .memory {
-                MemoryPopoverContent(monitor: monitor)
-            } else {
-                DiskPopoverContent(monitor: monitor)
+            ZStack {
+                if selectedPane == .memory {
+                    MemoryPopoverContent(monitor: monitor)
+                        .transition(.asymmetric(
+                            insertion: .move(edge: .leading).combined(with: .opacity),
+                            removal: .move(edge: .leading).combined(with: .opacity)
+                        ))
+                } else {
+                    DiskPopoverContent(monitor: monitor)
+                        .transition(.asymmetric(
+                            insertion: .move(edge: .trailing).combined(with: .opacity),
+                            removal: .move(edge: .trailing).combined(with: .opacity)
+                        ))
+                }
             }
+            .animation(paneAnimation, value: selectedPane)
+            .resourceSwipe(selectedPane: $selectedPane)
+            .clipped()
 
             Divider()
 
@@ -60,6 +96,7 @@ struct StatusPopoverView: View {
         }
         .padding(16)
         .frame(width: 420)
+        .resourceSwipe(selectedPane: $selectedPane)
     }
 }
 
@@ -79,14 +116,15 @@ struct DetailWindowView: View {
         }
     }
 
-    private var filteredVolumes: [DiskVolume] {
+    private var filteredDiskApps: [DiskAppUsage] {
         let keyword = searchText.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !keyword.isEmpty else { return monitor.diskVolumes }
+        guard !keyword.isEmpty else { return monitor.diskApps }
 
-        return monitor.diskVolumes.filter {
+        return monitor.diskApps.filter {
             $0.name.localizedCaseInsensitiveContains(keyword)
-                || $0.mountPath.localizedCaseInsensitiveContains(keyword)
-                || $0.fileSystem.localizedCaseInsensitiveContains(keyword)
+                || $0.path.localizedCaseInsensitiveContains(keyword)
+                || $0.bundleIdentifier.localizedCaseInsensitiveContains(keyword)
+                || $0.version.localizedCaseInsensitiveContains(keyword)
         }
     }
 
@@ -101,15 +139,28 @@ struct DetailWindowView: View {
             .padding(.horizontal, 20)
             .padding(.top, 16)
 
-            if selectedPane == .memory {
-                MemoryDetailHeader(snapshot: monitor.snapshot, lastUpdated: monitor.lastUpdated) {
-                    monitor.refresh()
-                }
-            } else {
-                DiskDetailHeader(snapshot: monitor.diskSnapshot, volumes: monitor.diskVolumes, lastUpdated: monitor.lastUpdated) {
-                    monitor.refresh()
+            ZStack {
+                if selectedPane == .memory {
+                    MemoryDetailHeader(snapshot: monitor.snapshot, lastUpdated: monitor.lastUpdated) {
+                        monitor.refresh()
+                    }
+                    .transition(.asymmetric(
+                        insertion: .move(edge: .leading).combined(with: .opacity),
+                        removal: .move(edge: .leading).combined(with: .opacity)
+                    ))
+                } else {
+                    DiskDetailHeader(snapshot: monitor.diskSnapshot, appCount: monitor.diskApps.count, lastUpdated: monitor.lastUpdated) {
+                        monitor.refresh()
+                    }
+                    .transition(.asymmetric(
+                        insertion: .move(edge: .trailing).combined(with: .opacity),
+                        removal: .move(edge: .trailing).combined(with: .opacity)
+                    ))
                 }
             }
+            .animation(paneAnimation, value: selectedPane)
+            .resourceSwipe(selectedPane: $selectedPane)
+            .clipped()
 
             Divider()
 
@@ -117,7 +168,7 @@ struct DetailWindowView: View {
                 Image(systemName: "magnifyingglass")
                     .foregroundStyle(.secondary)
 
-                TextField(selectedPane == .memory ? "搜索进程名称、PID 或路径" : "搜索磁盘名称、挂载点或格式", text: $searchText)
+                TextField(selectedPane == .memory ? "搜索进程名称、PID 或路径" : "搜索 App 名称、Bundle ID、版本或路径", text: $searchText)
                     .textFieldStyle(.plain)
 
                 if !searchText.isEmpty {
@@ -136,10 +187,11 @@ struct DetailWindowView: View {
             if selectedPane == .memory {
                 ProcessTable(processes: filteredProcesses)
             } else {
-                DiskTable(volumes: filteredVolumes)
+                DiskAppTable(apps: filteredDiskApps)
             }
         }
         .background(Color(nsColor: .windowBackgroundColor))
+        .resourceSwipe(selectedPane: $selectedPane)
     }
 }
 
@@ -246,15 +298,15 @@ private struct DiskPopoverContent: View {
                     Text("磁盘占用榜")
                         .font(.headline)
                     Spacer()
-                    Text("共 \(monitor.diskVolumes.count) 个")
+                    Text("共 \(monitor.diskApps.count) 个 App")
                         .font(.caption)
                         .foregroundStyle(.secondary)
                 }
 
                 ScrollView {
                     LazyVStack(spacing: 8) {
-                        ForEach(monitor.diskVolumes) { volume in
-                            CompactDiskRow(volume: volume)
+                        ForEach(monitor.diskApps) { app in
+                            CompactDiskAppRow(app: app)
                         }
                     }
                     .padding(.vertical, 2)
@@ -316,17 +368,9 @@ private struct MemoryDetailHeader: View {
 
 private struct DiskDetailHeader: View {
     let snapshot: DiskSnapshot
-    let volumes: [DiskVolume]
+    let appCount: Int
     let lastUpdated: Date
     let refresh: () -> Void
-
-    private var internalCount: Int {
-        volumes.filter(\.isInternal).count
-    }
-
-    private var externalCount: Int {
-        volumes.filter { !$0.isInternal }.count
-    }
 
     var body: some View {
         VStack(spacing: 16) {
@@ -369,8 +413,7 @@ private struct DiskDetailHeader: View {
                 StatCard(title: "已用空间", value: snapshot.usedBytes, systemImage: "internaldrive.fill")
                 StatCard(title: "可用空间", value: snapshot.availableBytes, systemImage: "externaldrive.badge.checkmark")
                 StatCard(title: "总容量", value: snapshot.totalBytes, systemImage: "square.stack.3d.up.fill")
-                CountStatCard(title: "内部卷", value: internalCount, systemImage: "desktopcomputer")
-                CountStatCard(title: "外部卷", value: externalCount, systemImage: "externaldrive.fill")
+                CountStatCard(title: "应用数量", value: appCount, systemImage: "app.badge")
             }
         }
         .padding(20)
@@ -487,27 +530,27 @@ private struct CompactProcessRow: View {
     }
 }
 
-private struct CompactDiskRow: View {
-    let volume: DiskVolume
+private struct CompactDiskAppRow: View {
+    let app: DiskAppUsage
 
     var body: some View {
         HStack(spacing: 10) {
-            Text("\(volume.rank)")
+            Text("\(app.rank)")
                 .font(.caption)
                 .monospacedDigit()
                 .foregroundStyle(.secondary)
                 .frame(width: 24, alignment: .trailing)
 
-            Image(nsImage: volume.icon)
+            Image(nsImage: app.icon)
                 .resizable()
                 .frame(width: 22, height: 22)
                 .cornerRadius(5)
 
             VStack(alignment: .leading, spacing: 2) {
-                Text(volume.name)
+                Text(app.name)
                     .font(.callout)
                     .lineLimit(1)
-                Text(volume.mountPath)
+                Text(app.path)
                     .font(.caption)
                     .foregroundStyle(.secondary)
                     .lineLimit(1)
@@ -517,11 +560,11 @@ private struct CompactDiskRow: View {
             Spacer()
 
             VStack(alignment: .trailing, spacing: 2) {
-                Text(Formatters.memory(volume.usedBytes))
+                Text(Formatters.memory(app.sizeBytes))
                     .font(.callout)
                     .fontWeight(.semibold)
                     .monospacedDigit()
-                Text(Formatters.percent(volume.usedPercent, digits: 1))
+                Text(Formatters.percent(app.diskPercent, digits: 2))
                     .font(.caption)
                     .foregroundStyle(.secondary)
                     .monospacedDigit()
@@ -633,17 +676,17 @@ private struct ProcessTableRow: View {
     }
 }
 
-private struct DiskTable: View {
-    let volumes: [DiskVolume]
+private struct DiskAppTable: View {
+    let apps: [DiskAppUsage]
 
     var body: some View {
         VStack(spacing: 0) {
-            DiskTableHeader()
+            DiskAppTableHeader()
 
             ScrollView {
                 LazyVStack(spacing: 0) {
-                    ForEach(volumes) { volume in
-                        DiskTableRow(volume: volume)
+                    ForEach(apps) { app in
+                        DiskAppTableRow(app: app)
                         Divider()
                             .padding(.leading, 20)
                     }
@@ -653,27 +696,23 @@ private struct DiskTable: View {
     }
 }
 
-private struct DiskTableHeader: View {
+private struct DiskAppTableHeader: View {
     var body: some View {
         HStack(spacing: 12) {
             Text("排名")
                 .frame(width: 44, alignment: .trailing)
-            Text("磁盘")
+            Text("App")
                 .frame(minWidth: 210, maxWidth: .infinity, alignment: .leading)
-            Text("已用")
-                .frame(width: 120, alignment: .trailing)
-            Text("可用")
-                .frame(width: 120, alignment: .trailing)
-            Text("总量")
+            Text("占用空间")
                 .frame(width: 120, alignment: .trailing)
             Text("占比")
                 .frame(width: 70, alignment: .trailing)
-            Text("格式")
+            Text("版本")
                 .frame(width: 130, alignment: .leading)
-            Text("类型")
-                .frame(width: 86, alignment: .leading)
-            Text("挂载点")
+            Text("Bundle ID")
                 .frame(minWidth: 220, maxWidth: .infinity, alignment: .leading)
+            Text("路径")
+                .frame(minWidth: 260, maxWidth: .infinity, alignment: .leading)
         }
         .font(.caption)
         .foregroundStyle(.secondary)
@@ -683,63 +722,60 @@ private struct DiskTableHeader: View {
     }
 }
 
-private struct DiskTableRow: View {
-    let volume: DiskVolume
+private struct DiskAppTableRow: View {
+    let app: DiskAppUsage
 
     var body: some View {
         HStack(spacing: 12) {
-            Text("\(volume.rank)")
+            Text("\(app.rank)")
                 .font(.callout)
                 .monospacedDigit()
                 .foregroundStyle(.secondary)
                 .frame(width: 44, alignment: .trailing)
 
             HStack(spacing: 10) {
-                Image(nsImage: volume.icon)
+                Image(nsImage: app.icon)
                     .resizable()
                     .frame(width: 28, height: 28)
                     .cornerRadius(6)
 
                 VStack(alignment: .leading, spacing: 3) {
-                    Text(volume.name)
+                    Text(app.name)
                         .font(.callout)
                         .fontWeight(.medium)
                         .lineLimit(1)
-                    Text(volume.isReadOnly ? "只读" : "可写")
+                    Text(app.path)
                         .font(.caption)
                         .foregroundStyle(.secondary)
+                        .lineLimit(1)
+                        .truncationMode(.middle)
                 }
             }
             .frame(minWidth: 210, maxWidth: .infinity, alignment: .leading)
 
-            Text(Formatters.memory(volume.usedBytes))
+            Text(Formatters.memory(app.sizeBytes))
                 .monospacedDigit()
                 .frame(width: 120, alignment: .trailing)
 
-            Text(Formatters.memory(volume.availableBytes))
-                .monospacedDigit()
-                .frame(width: 120, alignment: .trailing)
-
-            Text(Formatters.memory(volume.totalBytes))
-                .monospacedDigit()
-                .frame(width: 120, alignment: .trailing)
-
-            Text(Formatters.percent(volume.usedPercent, digits: 1))
+            Text(Formatters.percent(app.diskPercent, digits: 2))
                 .monospacedDigit()
                 .frame(width: 70, alignment: .trailing)
 
-            Text(volume.fileSystem)
+            Text(app.version)
                 .lineLimit(1)
                 .frame(width: 130, alignment: .leading)
 
-            Text(volume.isInternal ? "内部" : "外部")
-                .frame(width: 86, alignment: .leading)
-
-            Text(volume.mountPath)
+            Text(app.bundleIdentifier)
                 .lineLimit(1)
                 .truncationMode(.middle)
                 .foregroundStyle(.secondary)
                 .frame(minWidth: 220, maxWidth: .infinity, alignment: .leading)
+
+            Text(app.path)
+                .lineLimit(1)
+                .truncationMode(.middle)
+                .foregroundStyle(.secondary)
+                .frame(minWidth: 260, maxWidth: .infinity, alignment: .leading)
         }
         .padding(.horizontal, 20)
         .padding(.vertical, 10)

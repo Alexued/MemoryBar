@@ -62,18 +62,16 @@ struct DiskSnapshot {
     }
 }
 
-struct DiskVolume: Identifiable {
+struct DiskAppUsage: Identifiable {
     let id: String
     let rank: Int
     let name: String
-    let mountPath: String
-    let totalBytes: UInt64
-    let usedBytes: UInt64
-    let availableBytes: UInt64
-    let usedPercent: Double
-    let fileSystem: String
-    let isInternal: Bool
-    let isReadOnly: Bool
+    let path: String
+    let sizeBytes: UInt64
+    let diskPercent: Double
+    let bundleIdentifier: String
+    let version: String
+    let lastModified: Date?
     let icon: NSImage
 }
 
@@ -89,17 +87,18 @@ final class SystemMonitor: ObservableObject {
     )
     @Published private(set) var processes: [MemoryProcess] = []
     @Published private(set) var diskSnapshot = DiskSnapshot.empty
-    @Published private(set) var diskVolumes: [DiskVolume] = []
+    @Published private(set) var diskApps: [DiskAppUsage] = []
     @Published private(set) var lastUpdated = Date()
 
     private var timer: Timer?
+    private var cachedDiskApps: [DiskAppUsage] = []
     private let queue = DispatchQueue(label: "MemoryBar.SystemMonitor", qos: .utility)
 
     func start() {
         refresh()
         timer?.invalidate()
         timer = Timer.scheduledTimer(withTimeInterval: 2, repeats: true) { [weak self] _ in
-            self?.refresh()
+            self?.refresh(forceDiskApps: false)
         }
     }
 
@@ -108,19 +107,26 @@ final class SystemMonitor: ObservableObject {
         timer = nil
     }
 
-    func refresh() {
+    func refresh(forceDiskApps: Bool = true) {
         queue.async { [weak self] in
             guard let self else { return }
             let snapshot = Self.readMemorySnapshot()
             let processes = Self.readProcesses()
-            let diskState = Self.readDiskState()
+            let diskSnapshot = Self.readDiskSnapshot()
+            let diskApps: [DiskAppUsage]
+            if forceDiskApps || self.cachedDiskApps.isEmpty {
+                diskApps = Self.readDiskApps(diskTotalBytes: diskSnapshot.totalBytes)
+                self.cachedDiskApps = diskApps
+            } else {
+                diskApps = self.cachedDiskApps
+            }
             let now = Date()
 
             DispatchQueue.main.async {
                 self.snapshot = snapshot
                 self.processes = processes
-                self.diskSnapshot = diskState.snapshot
-                self.diskVolumes = diskState.volumes
+                self.diskSnapshot = diskSnapshot
+                self.diskApps = diskApps
                 self.lastUpdated = now
             }
         }
@@ -302,83 +308,21 @@ final class SystemMonitor: ObservableObject {
         return String(data: data, encoding: .utf8) ?? ""
     }
 
-    private static func readDiskState() -> (snapshot: DiskSnapshot, volumes: [DiskVolume]) {
+    private static func readDiskSnapshot() -> DiskSnapshot {
         let keys: Set<URLResourceKey> = [
             .volumeNameKey,
             .volumeTotalCapacityKey,
             .volumeAvailableCapacityKey,
             .volumeAvailableCapacityForImportantUsageKey,
-            .volumeLocalizedFormatDescriptionKey,
-            .volumeIsInternalKey,
-            .volumeIsReadOnlyKey
+            .volumeLocalizedFormatDescriptionKey
         ]
 
-        let volumeURLs = FileManager.default.mountedVolumeURLs(
-            includingResourceValuesForKeys: Array(keys),
-            options: [.skipHiddenVolumes]
-        ) ?? []
-
-        let parsedVolumes = volumeURLs.compactMap { parseDiskVolume(url: $0, keys: keys) }
-        let sortedVolumes = parsedVolumes.sorted {
-            if $0.usedPercent == $1.usedPercent {
-                return $0.usedBytes > $1.usedBytes
-            }
-            return $0.usedPercent > $1.usedPercent
-        }
-
-        let volumes = sortedVolumes.enumerated().map { index, volume in
-            DiskVolume(
-                id: volume.mountPath,
-                rank: index + 1,
-                name: volume.name,
-                mountPath: volume.mountPath,
-                totalBytes: volume.totalBytes,
-                usedBytes: volume.usedBytes,
-                availableBytes: volume.availableBytes,
-                usedPercent: volume.usedPercent,
-                fileSystem: volume.fileSystem,
-                isInternal: volume.isInternal,
-                isReadOnly: volume.isReadOnly,
-                icon: volume.icon
-            )
-        }
-
-        let rootVolume = parseDiskVolume(url: URL(fileURLWithPath: "/"), keys: keys)
-            ?? sortedVolumes.first
-
-        let snapshot = rootVolume.map {
-            DiskSnapshot(
-                name: $0.name,
-                mountPath: $0.mountPath,
-                totalBytes: $0.totalBytes,
-                usedBytes: $0.usedBytes,
-                availableBytes: $0.availableBytes,
-                fileSystem: $0.fileSystem
-            )
-        } ?? .empty
-
-        return (snapshot, volumes)
-    }
-
-    private struct ParsedDiskVolume {
-        let name: String
-        let mountPath: String
-        let totalBytes: UInt64
-        let usedBytes: UInt64
-        let availableBytes: UInt64
-        let usedPercent: Double
-        let fileSystem: String
-        let isInternal: Bool
-        let isReadOnly: Bool
-        let icon: NSImage
-    }
-
-    private static func parseDiskVolume(url: URL, keys: Set<URLResourceKey>) -> ParsedDiskVolume? {
+        let url = URL(fileURLWithPath: "/")
         guard let values = try? url.resourceValues(forKeys: keys),
               let totalCapacity = values.volumeTotalCapacity,
               totalCapacity > 0
         else {
-            return nil
+            return .empty
         }
 
         let total = UInt64(totalCapacity)
@@ -390,25 +334,150 @@ final class SystemMonitor: ObservableObject {
         }
         let available = min(total, importantAvailable ?? standardAvailable ?? 0)
         let used = total > available ? total - available : 0
-        let usedPercent = total > 0 ? Double(used) / Double(total) * 100 : 0
-        let path = url.path.isEmpty ? "/" : url.path
+        let path = "/"
         let name = values.volumeName?.isEmpty == false
-            ? values.volumeName ?? path
-            : (path == "/" ? "启动磁盘" : url.lastPathComponent)
-        let icon = NSWorkspace.shared.icon(forFile: path)
-        icon.size = NSSize(width: 24, height: 24)
+            ? values.volumeName ?? "启动磁盘"
+            : "启动磁盘"
 
-        return ParsedDiskVolume(
+        return DiskSnapshot(
             name: name,
             mountPath: path,
             totalBytes: total,
             usedBytes: used,
             availableBytes: available,
-            usedPercent: usedPercent,
-            fileSystem: values.volumeLocalizedFormatDescription ?? "未知",
-            isInternal: values.volumeIsInternal ?? false,
-            isReadOnly: values.volumeIsReadOnly ?? false,
+            fileSystem: values.volumeLocalizedFormatDescription ?? "未知"
+        )
+    }
+
+    private static func readDiskApps(diskTotalBytes: UInt64) -> [DiskAppUsage] {
+        let apps = discoverApplicationURLs()
+            .compactMap { parseDiskApp(url: $0, diskTotalBytes: diskTotalBytes) }
+            .sorted { $0.sizeBytes > $1.sizeBytes }
+
+        return apps.enumerated().map { index, app in
+            DiskAppUsage(
+                id: app.id,
+                rank: index + 1,
+                name: app.name,
+                path: app.path,
+                sizeBytes: app.sizeBytes,
+                diskPercent: app.diskPercent,
+                bundleIdentifier: app.bundleIdentifier,
+                version: app.version,
+                lastModified: app.lastModified,
+                icon: app.icon
+            )
+        }
+    }
+
+    private static func discoverApplicationURLs() -> [URL] {
+        let roots = [
+            URL(fileURLWithPath: "/Applications", isDirectory: true),
+            URL(fileURLWithPath: "/System/Applications", isDirectory: true),
+            URL(fileURLWithPath: "/System/Applications/Utilities", isDirectory: true),
+            URL(fileURLWithPath: "/Applications/Utilities", isDirectory: true),
+            URL(fileURLWithPath: NSHomeDirectory()).appendingPathComponent("Applications", isDirectory: true)
+        ]
+
+        let keys: [URLResourceKey] = [.isDirectoryKey, .isPackageKey]
+        var seen = Set<String>()
+        var results: [URL] = []
+
+        for root in roots where FileManager.default.fileExists(atPath: root.path) {
+            guard let enumerator = FileManager.default.enumerator(
+                at: root,
+                includingPropertiesForKeys: keys,
+                options: [.skipsHiddenFiles],
+                errorHandler: { _, _ in true }
+            ) else {
+                continue
+            }
+
+            for case let url as URL in enumerator {
+                guard url.pathExtension.localizedCaseInsensitiveCompare("app") == .orderedSame else {
+                    continue
+                }
+
+                let standardizedPath = url.standardizedFileURL.path
+                if seen.insert(standardizedPath).inserted {
+                    results.append(url.standardizedFileURL)
+                }
+                enumerator.skipDescendants()
+            }
+        }
+
+        return results
+    }
+
+    private static func parseDiskApp(url: URL, diskTotalBytes: UInt64) -> DiskAppUsage? {
+        let size = allocatedSize(of: url)
+        guard size > 0 else {
+            return nil
+        }
+
+        let bundle = Bundle(url: url)
+        let localizedName = bundle?.object(forInfoDictionaryKey: "CFBundleDisplayName") as? String
+            ?? bundle?.object(forInfoDictionaryKey: "CFBundleName") as? String
+        let name = localizedName?.isEmpty == false
+            ? localizedName ?? url.deletingPathExtension().lastPathComponent
+            : url.deletingPathExtension().lastPathComponent
+        let bundleIdentifier = bundle?.bundleIdentifier ?? "未知"
+        let version = bundle?.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String
+            ?? bundle?.object(forInfoDictionaryKey: "CFBundleVersion") as? String
+            ?? "未知"
+        let values = try? url.resourceValues(forKeys: [.contentModificationDateKey])
+        let icon = NSWorkspace.shared.icon(forFile: url.path)
+        icon.size = NSSize(width: 24, height: 24)
+        let percent = diskTotalBytes > 0 ? Double(size) / Double(diskTotalBytes) * 100 : 0
+
+        return DiskAppUsage(
+            id: url.path,
+            rank: 0,
+            name: name,
+            path: url.path,
+            sizeBytes: size,
+            diskPercent: percent,
+            bundleIdentifier: bundleIdentifier,
+            version: version,
+            lastModified: values?.contentModificationDate,
             icon: icon
         )
+    }
+
+    private static func allocatedSize(of url: URL) -> UInt64 {
+        let keys: [URLResourceKey] = [
+            .isRegularFileKey,
+            .fileAllocatedSizeKey,
+            .totalFileAllocatedSizeKey
+        ]
+        var total: UInt64 = 0
+
+        if let values = try? url.resourceValues(forKeys: Set(keys)),
+           let directorySize = values.totalFileAllocatedSize ?? values.fileAllocatedSize,
+           directorySize > 0 {
+            total += UInt64(directorySize)
+        }
+
+        guard let enumerator = FileManager.default.enumerator(
+            at: url,
+            includingPropertiesForKeys: keys,
+            options: [.skipsHiddenFiles],
+            errorHandler: { _, _ in true }
+        ) else {
+            return total
+        }
+
+        for case let itemURL as URL in enumerator {
+            guard let values = try? itemURL.resourceValues(forKeys: Set(keys)) else {
+                continue
+            }
+
+            let size = values.totalFileAllocatedSize ?? values.fileAllocatedSize ?? 0
+            if size > 0 {
+                total += UInt64(size)
+            }
+        }
+
+        return total
     }
 }
