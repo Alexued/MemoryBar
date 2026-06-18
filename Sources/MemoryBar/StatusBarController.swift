@@ -3,22 +3,22 @@ import Combine
 import SwiftUI
 
 final class StatusBarController: NSObject, NSPopoverDelegate {
-    private let monitor: MemoryMonitor
+    private let monitor: SystemMonitor
     private let statusItem: NSStatusItem
     private let popover = NSPopover()
     private var cancellable: AnyCancellable?
     private var globalMouseMonitor: Any?
     private var localMouseMonitor: Any?
 
-    init(monitor: MemoryMonitor, openDetails: @escaping () -> Void) {
+    init(monitor: SystemMonitor, openDetails: @escaping () -> Void) {
         self.monitor = monitor
         self.statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
         super.init()
 
         if let button = statusItem.button {
-            button.image = NSImage(systemSymbolName: "memorychip", accessibilityDescription: "内存")
+            button.image = NSImage(systemSymbolName: "gauge.with.dots.needle.bottom.50percent", accessibilityDescription: "系统资源")
             button.imagePosition = .imageLeading
-            button.title = "内存 --%"
+            button.title = "内存 --% 磁盘 --%"
             button.target = self
             button.action = #selector(togglePopover(_:))
         }
@@ -39,10 +39,10 @@ final class StatusBarController: NSObject, NSPopoverDelegate {
             )
         )
 
-        cancellable = monitor.$snapshot
+        cancellable = Publishers.CombineLatest(monitor.$snapshot, monitor.$diskSnapshot)
             .receive(on: RunLoop.main)
-            .sink { [weak self] snapshot in
-                self?.statusItem.button?.title = "内存 \(Formatters.percent(snapshot.usedPercent))"
+            .sink { [weak self] snapshot, diskSnapshot in
+                self?.statusItem.button?.title = "内存 \(Formatters.percent(snapshot.usedPercent)) 磁盘 \(Formatters.percent(diskSnapshot.usedPercent))"
         }
     }
 

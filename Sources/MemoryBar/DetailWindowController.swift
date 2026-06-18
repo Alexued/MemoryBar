@@ -2,10 +2,10 @@ import AppKit
 import SwiftUI
 
 final class DetailWindowController: NSObject, NSWindowDelegate {
-    private let monitor: MemoryMonitor
+    private let monitor: SystemMonitor
     private var window: NSWindow?
 
-    init(monitor: MemoryMonitor) {
+    init(monitor: SystemMonitor) {
         self.monitor = monitor
         super.init()
     }
@@ -15,9 +15,9 @@ final class DetailWindowController: NSObject, NSWindowDelegate {
             let view = DetailWindowView(monitor: monitor)
             let hostingController = NSHostingController(rootView: view)
             let newWindow = NSWindow(contentViewController: hostingController)
-            newWindow.title = "内存管理工具"
-            newWindow.setContentSize(NSSize(width: 980, height: 680))
-            newWindow.minSize = NSSize(width: 820, height: 560)
+            newWindow.title = "系统资源管理工具"
+            newWindow.setContentSize(NSSize(width: 1080, height: 720))
+            newWindow.minSize = NSSize(width: 900, height: 600)
             newWindow.styleMask = [.titled, .closable, .miniaturizable, .resizable]
             newWindow.isReleasedWhenClosed = false
             newWindow.center()

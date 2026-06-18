@@ -1,7 +1,7 @@
 import AppKit
 
 final class AppDelegate: NSObject, NSApplicationDelegate {
-    private let monitor = MemoryMonitor()
+    private let monitor = SystemMonitor()
     private var statusBarController: StatusBarController?
     private var detailWindowController: DetailWindowController?
 

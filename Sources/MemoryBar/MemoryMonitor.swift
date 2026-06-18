@@ -35,7 +35,49 @@ struct MemoryProcess: Identifiable {
     let icon: NSImage
 }
 
-final class MemoryMonitor: ObservableObject {
+struct DiskSnapshot {
+    static let empty = DiskSnapshot(
+        name: "启动磁盘",
+        mountPath: "/",
+        totalBytes: 0,
+        usedBytes: 0,
+        availableBytes: 0,
+        fileSystem: "未知"
+    )
+
+    let name: String
+    let mountPath: String
+    let totalBytes: UInt64
+    let usedBytes: UInt64
+    let availableBytes: UInt64
+    let fileSystem: String
+
+    var usedRatio: Double {
+        guard totalBytes > 0 else { return 0 }
+        return min(1, Double(usedBytes) / Double(totalBytes))
+    }
+
+    var usedPercent: Double {
+        usedRatio * 100
+    }
+}
+
+struct DiskVolume: Identifiable {
+    let id: String
+    let rank: Int
+    let name: String
+    let mountPath: String
+    let totalBytes: UInt64
+    let usedBytes: UInt64
+    let availableBytes: UInt64
+    let usedPercent: Double
+    let fileSystem: String
+    let isInternal: Bool
+    let isReadOnly: Bool
+    let icon: NSImage
+}
+
+final class SystemMonitor: ObservableObject {
     @Published private(set) var snapshot = MemorySnapshot(
         totalBytes: 0,
         usedBytes: 0,
@@ -46,10 +88,12 @@ final class MemoryMonitor: ObservableObject {
         freeBytes: 0
     )
     @Published private(set) var processes: [MemoryProcess] = []
+    @Published private(set) var diskSnapshot = DiskSnapshot.empty
+    @Published private(set) var diskVolumes: [DiskVolume] = []
     @Published private(set) var lastUpdated = Date()
 
     private var timer: Timer?
-    private let queue = DispatchQueue(label: "MemoryBar.MemoryMonitor", qos: .utility)
+    private let queue = DispatchQueue(label: "MemoryBar.SystemMonitor", qos: .utility)
 
     func start() {
         refresh()
@@ -69,11 +113,14 @@ final class MemoryMonitor: ObservableObject {
             guard let self else { return }
             let snapshot = Self.readMemorySnapshot()
             let processes = Self.readProcesses()
+            let diskState = Self.readDiskState()
             let now = Date()
 
             DispatchQueue.main.async {
                 self.snapshot = snapshot
                 self.processes = processes
+                self.diskSnapshot = diskState.snapshot
+                self.diskVolumes = diskState.volumes
                 self.lastUpdated = now
             }
         }
@@ -253,5 +300,115 @@ final class MemoryMonitor: ObservableObject {
         }
 
         return String(data: data, encoding: .utf8) ?? ""
+    }
+
+    private static func readDiskState() -> (snapshot: DiskSnapshot, volumes: [DiskVolume]) {
+        let keys: Set<URLResourceKey> = [
+            .volumeNameKey,
+            .volumeTotalCapacityKey,
+            .volumeAvailableCapacityKey,
+            .volumeAvailableCapacityForImportantUsageKey,
+            .volumeLocalizedFormatDescriptionKey,
+            .volumeIsInternalKey,
+            .volumeIsReadOnlyKey
+        ]
+
+        let volumeURLs = FileManager.default.mountedVolumeURLs(
+            includingResourceValuesForKeys: Array(keys),
+            options: [.skipHiddenVolumes]
+        ) ?? []
+
+        let parsedVolumes = volumeURLs.compactMap { parseDiskVolume(url: $0, keys: keys) }
+        let sortedVolumes = parsedVolumes.sorted {
+            if $0.usedPercent == $1.usedPercent {
+                return $0.usedBytes > $1.usedBytes
+            }
+            return $0.usedPercent > $1.usedPercent
+        }
+
+        let volumes = sortedVolumes.enumerated().map { index, volume in
+            DiskVolume(
+                id: volume.mountPath,
+                rank: index + 1,
+                name: volume.name,
+                mountPath: volume.mountPath,
+                totalBytes: volume.totalBytes,
+                usedBytes: volume.usedBytes,
+                availableBytes: volume.availableBytes,
+                usedPercent: volume.usedPercent,
+                fileSystem: volume.fileSystem,
+                isInternal: volume.isInternal,
+                isReadOnly: volume.isReadOnly,
+                icon: volume.icon
+            )
+        }
+
+        let rootVolume = parseDiskVolume(url: URL(fileURLWithPath: "/"), keys: keys)
+            ?? sortedVolumes.first
+
+        let snapshot = rootVolume.map {
+            DiskSnapshot(
+                name: $0.name,
+                mountPath: $0.mountPath,
+                totalBytes: $0.totalBytes,
+                usedBytes: $0.usedBytes,
+                availableBytes: $0.availableBytes,
+                fileSystem: $0.fileSystem
+            )
+        } ?? .empty
+
+        return (snapshot, volumes)
+    }
+
+    private struct ParsedDiskVolume {
+        let name: String
+        let mountPath: String
+        let totalBytes: UInt64
+        let usedBytes: UInt64
+        let availableBytes: UInt64
+        let usedPercent: Double
+        let fileSystem: String
+        let isInternal: Bool
+        let isReadOnly: Bool
+        let icon: NSImage
+    }
+
+    private static func parseDiskVolume(url: URL, keys: Set<URLResourceKey>) -> ParsedDiskVolume? {
+        guard let values = try? url.resourceValues(forKeys: keys),
+              let totalCapacity = values.volumeTotalCapacity,
+              totalCapacity > 0
+        else {
+            return nil
+        }
+
+        let total = UInt64(totalCapacity)
+        let importantAvailable = values.volumeAvailableCapacityForImportantUsage.flatMap {
+            $0 >= 0 ? UInt64($0) : nil
+        }
+        let standardAvailable = values.volumeAvailableCapacity.flatMap {
+            $0 >= 0 ? UInt64($0) : nil
+        }
+        let available = min(total, importantAvailable ?? standardAvailable ?? 0)
+        let used = total > available ? total - available : 0
+        let usedPercent = total > 0 ? Double(used) / Double(total) * 100 : 0
+        let path = url.path.isEmpty ? "/" : url.path
+        let name = values.volumeName?.isEmpty == false
+            ? values.volumeName ?? path
+            : (path == "/" ? "启动磁盘" : url.lastPathComponent)
+        let icon = NSWorkspace.shared.icon(forFile: path)
+        icon.size = NSSize(width: 24, height: 24)
+
+        return ParsedDiskVolume(
+            name: name,
+            mountPath: path,
+            totalBytes: total,
+            usedBytes: used,
+            availableBytes: available,
+            usedPercent: usedPercent,
+            fileSystem: values.volumeLocalizedFormatDescription ?? "未知",
+            isInternal: values.volumeIsInternal ?? false,
+            isReadOnly: values.volumeIsReadOnly ?? false,
+            icon: icon
+        )
     }
 }
