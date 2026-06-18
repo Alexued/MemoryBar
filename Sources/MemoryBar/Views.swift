@@ -10,26 +10,162 @@ enum ResourcePane: String, CaseIterable, Identifiable {
 
 private let paneAnimation = Animation.timingCurve(0.22, 1.0, 0.36, 1.0, duration: 0.36)
 
-private extension View {
-    func resourceSwipe(selectedPane: Binding<ResourcePane>) -> some View {
-        simultaneousGesture(
-            DragGesture(minimumDistance: 28)
-                .onEnded { value in
-                    guard abs(value.translation.width) > abs(value.translation.height) else {
-                        return
-                    }
+private func switchPane(_ selectedPane: Binding<ResourcePane>, to pane: ResourcePane) {
+    guard selectedPane.wrappedValue != pane else {
+        return
+    }
 
-                    withAnimation(paneAnimation) {
-                        if value.translation.width < 0 {
-                            selectedPane.wrappedValue = .disk
-                        } else {
-                            selectedPane.wrappedValue = .memory
-                        }
-                    }
-                }
-        )
+    withAnimation(paneAnimation) {
+        selectedPane.wrappedValue = pane
     }
 }
+
+private extension View {
+    func resourceSwipe(selectedPane: Binding<ResourcePane>) -> some View {
+        modifier(ResourceSwipeModifier(selectedPane: selectedPane))
+    }
+}
+
+private struct ResourceSwipeModifier: ViewModifier {
+    @Binding var selectedPane: ResourcePane
+
+    func body(content: Content) -> some View {
+        content
+            .simultaneousGesture(
+                DragGesture(minimumDistance: 28)
+                    .onEnded { value in
+                        guard abs(value.translation.width) > abs(value.translation.height) else {
+                            return
+                        }
+
+                        if value.translation.width < 0 {
+                            switchPane($selectedPane, to: .disk)
+                        } else {
+                            switchPane($selectedPane, to: .memory)
+                        }
+                    }
+            )
+            .background(
+                TrackpadSwipeMonitor { direction in
+                    switch direction {
+                    case .left:
+                        switchPane($selectedPane, to: .disk)
+                    case .right:
+                        switchPane($selectedPane, to: .memory)
+                    }
+                }
+            )
+    }
+}
+
+private enum TrackpadSwipeDirection {
+    case left
+    case right
+}
+
+private struct TrackpadSwipeMonitor: NSViewRepresentable {
+    let onSwipe: (TrackpadSwipeDirection) -> Void
+
+    func makeCoordinator() -> Coordinator {
+        Coordinator(onSwipe: onSwipe)
+    }
+
+    func makeNSView(context: Context) -> SwipeMonitorView {
+        let view = SwipeMonitorView()
+        context.coordinator.view = view
+        context.coordinator.install()
+        return view
+    }
+
+    func updateNSView(_ nsView: SwipeMonitorView, context: Context) {
+        context.coordinator.view = nsView
+        context.coordinator.onSwipe = onSwipe
+    }
+
+    static func dismantleNSView(_ nsView: SwipeMonitorView, coordinator: Coordinator) {
+        coordinator.uninstall()
+    }
+
+    final class Coordinator {
+        weak var view: SwipeMonitorView?
+        var onSwipe: (TrackpadSwipeDirection) -> Void
+        private var monitor: Any?
+        private var accumulatedX: CGFloat = 0
+        private var accumulatedY: CGFloat = 0
+        private var lastSwipeDate = Date.distantPast
+
+        init(onSwipe: @escaping (TrackpadSwipeDirection) -> Void) {
+            self.onSwipe = onSwipe
+        }
+
+        func install() {
+            guard monitor == nil else {
+                return
+            }
+
+            monitor = NSEvent.addLocalMonitorForEvents(matching: .scrollWheel) { [weak self] event in
+                self?.handle(event) ?? event
+            }
+        }
+
+        func uninstall() {
+            if let monitor {
+                NSEvent.removeMonitor(monitor)
+                self.monitor = nil
+            }
+        }
+
+        private func handle(_ event: NSEvent) -> NSEvent? {
+            guard let view,
+                  let window = view.window,
+                  event.window === window
+            else {
+                reset()
+                return event
+            }
+
+            let location = view.convert(event.locationInWindow, from: nil)
+            guard view.bounds.contains(location) else {
+                reset()
+                return event
+            }
+
+            let deltaX = event.scrollingDeltaX
+            let deltaY = event.scrollingDeltaY
+
+            guard abs(deltaX) > abs(deltaY) * 1.35, abs(deltaX) > 1.5 else {
+                if abs(deltaY) > abs(deltaX) {
+                    reset()
+                }
+                return event
+            }
+
+            accumulatedX += deltaX
+            accumulatedY += deltaY
+
+            let now = Date()
+            guard abs(accumulatedX) > 28,
+                  abs(accumulatedX) > abs(accumulatedY) * 1.65,
+                  now.timeIntervalSince(lastSwipeDate) > 0.4
+            else {
+                return event
+            }
+
+            lastSwipeDate = now
+            let direction: TrackpadSwipeDirection = accumulatedX > 0 ? .left : .right
+            reset()
+            onSwipe(direction)
+            return nil
+        }
+
+        private func reset() {
+            accumulatedX = 0
+            accumulatedY = 0
+        }
+    }
+}
+
+private final class SwipeMonitorView: NSView {}
 
 struct StatusPopoverView: View {
     @ObservedObject var monitor: SystemMonitor
@@ -62,7 +198,6 @@ struct StatusPopoverView: View {
                 }
             }
             .animation(paneAnimation, value: selectedPane)
-            .resourceSwipe(selectedPane: $selectedPane)
             .clipped()
 
             Divider()
@@ -159,7 +294,6 @@ struct DetailWindowView: View {
                 }
             }
             .animation(paneAnimation, value: selectedPane)
-            .resourceSwipe(selectedPane: $selectedPane)
             .clipped()
 
             Divider()
