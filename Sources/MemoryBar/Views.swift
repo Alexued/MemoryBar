@@ -124,12 +124,6 @@ private struct TrackpadSwipeMonitor: NSViewRepresentable {
                 return event
             }
 
-            let location = view.convert(event.locationInWindow, from: nil)
-            guard view.bounds.contains(location) else {
-                reset()
-                return event
-            }
-
             let deltaX = event.scrollingDeltaX
             let deltaY = event.scrollingDeltaY
 
